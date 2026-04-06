@@ -21,7 +21,7 @@ from environment.models import Action
 # ============================================
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-API_KEY = os.environ.get("OPENAI_API_KEY", "")
+API_KEY = os.environ.get("HF_TOKEN")
 
 # Environment configuration
 BENCHMARK_NAME = "sql_analyst"
@@ -122,7 +122,7 @@ def run_inference():
     # Initialize OpenAI client
     client = OpenAI(
         base_url=API_BASE_URL,
-        api_key=API_KEY if API_KEY else "dummy-key-for-local"
+        api_key=HF_TOKEN if HF_TOKEN else "dummy-key-for-local"
     )
     
     # Initialize environment
