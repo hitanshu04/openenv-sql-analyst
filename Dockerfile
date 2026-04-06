@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for layer caching
 COPY requirements.txt .
 
-# Install Python dependencies with no cache to save space
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies WITH UV added for the hotfix
+RUN pip install --no-cache-dir -r requirements.txt uv
 
 # Copy application code
 COPY . .
@@ -27,5 +27,5 @@ EXPOSE 7860
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Startup command for OpenEnv serving
-CMD ["openenv", "serve", "--port", "7860"]
+# Replaced deprecated 'openenv serve' with the command the runtime error requested
+CMD ["uv", "run", "--project", ".", "server", "--port", "7860"]
