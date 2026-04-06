@@ -148,7 +148,7 @@ All graders implement:
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/hitanshu04/openenv-sql-analyst.git
 cd openenv_sql_analyst
 
 # Build the Docker image
