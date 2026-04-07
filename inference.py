@@ -2,11 +2,13 @@
 # inference.py
 # Baseline Inference Script for OpenEnv SQL Analyst
 # Uses OpenAI API client to run model against the environment
+#
+# HACKATHON REQUIREMENT: Must run ALL 3 tasks and output [START]/[STEP]/[END] for each
 
 import os
 import sys
 import json
-from typing import Optional
+from typing import Optional, List, Tuple
 
 # Add the project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openai import OpenAI
 from environment.env import SQLAnalystEnv
 from environment.models import Action
+from environment.tasks import TASKS
 
 
 # Environment configuration
@@ -22,7 +25,7 @@ MAX_STEPS = 15
 
 
 # ============================================
-# SYSTEM PROMPT
+# SYSTEM PROMPT - Note: curly braces are escaped as {{ }}
 # ============================================
 SYSTEM_PROMPT = """You are an expert SQL Data Analyst AI agent. Your task is to answer business questions by querying a SQLite database.
 
@@ -102,18 +105,169 @@ def parse_model_response(response_text: str) -> Optional[Action]:
         return None
 
 
+def run_single_task(
+    client: OpenAI, model_name: str, task_id: str
+) -> Tuple[bool, float]:
+    """
+    Run inference for a single task.
+
+    Args:
+        client: OpenAI client configured with LiteLLM proxy
+        model_name: Model identifier
+        task_id: The specific task to run
+
+    Returns:
+        Tuple of (success, final_score)
+    """
+    # Initialize environment and reset with specific task
+    env = SQLAnalystEnv()
+    observation = env.reset(task_id=task_id)
+
+    # Get task info from state
+    state = env.state()
+    task_name = state.get("task_id", "unknown")
+
+    # Track rewards and steps
+    rewards: List[float] = []
+    step_num = 0
+    done = False
+    success = False
+    final_score = 0.01  # Default to MIN_SCORE (strictly > 0)
+
+    # ============================================
+    # [START] LOG - EXACT FORMAT REQUIRED
+    # ============================================
+    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={model_name}")
+
+    try:
+        while not done and step_num < MAX_STEPS:
+            step_num += 1
+
+            # Build the prompt
+            error_section = ""
+            if observation.error_message:
+                error_section = f"ERROR FROM LAST ACTION:\n{observation.error_message}"
+
+            prompt = SYSTEM_PROMPT.format(
+                schema_info=observation.schema_info,
+                current_question=observation.current_question,
+                last_query_result=observation.last_query_result,
+                error_section=error_section,
+            )
+
+            try:
+                # Call the model via the injected LiteLLM proxy
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a SQL expert. Respond only with valid JSON.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=500,
+                )
+
+                # Extract response text
+                response_text = response.choices[0].message.content
+
+                # Parse into Action
+                action = parse_model_response(response_text)
+
+                if action is None:
+                    # Failed to parse, try a simple query as fallback
+                    action = Action(sql_query="SELECT 1")
+                    error_msg = "parse_error"
+                else:
+                    error_msg = "null"
+
+                # Execute action in environment
+                observation, reward, done, info = env.step(action)
+
+                # Track reward
+                reward_value = reward.value
+                rewards.append(reward_value)
+
+                # Check for errors in observation
+                if observation.error_message:
+                    error_msg = observation.error_message.replace("\n", " ")[:50]
+
+                # ============================================
+                # [STEP] LOG - EXACT FORMAT REQUIRED
+                # ============================================
+                action_str = format_action_str(action)
+                done_str = "true" if done else "false"
+                print(
+                    f"[STEP]  step={step_num} action={action_str} reward={reward_value:.2f} done={done_str} error={error_msg}"
+                )
+
+                # Update final results
+                if done:
+                    success = info.get("success", False)
+                    final_score = info.get("final_score", 0.01)
+                    # Ensure score is strictly between 0 and 1
+                    if final_score <= 0.0:
+                        final_score = 0.01
+                    if final_score >= 1.0:
+                        final_score = 0.99
+
+            except Exception as e:
+                # Handle API or other errors
+                error_msg = str(e).replace("\n", " ")[:50]
+                print(
+                    f"[STEP]  step={step_num} action=error reward=0.00 done=false error={error_msg}"
+                )
+                rewards.append(0.0)
+
+                # Try to continue with a simple action
+                try:
+                    action = Action(submit_answer="error")
+                    observation, reward, done, info = env.step(action)
+                    success = info.get("success", False)
+                    final_score = info.get("final_score", 0.01)
+                    # Ensure score is strictly between 0 and 1
+                    if final_score <= 0.0:
+                        final_score = 0.01
+                    if final_score >= 1.0:
+                        final_score = 0.99
+                except:
+                    done = True
+                    success = False
+                    final_score = 0.01
+
+    finally:
+        # ============================================
+        # [END] LOG - EXACT FORMAT REQUIRED
+        # MUST ALWAYS BE EMITTED, EVEN ON EXCEPTION
+        # ============================================
+        success_str = "true" if success else "false"
+        rewards_str = ",".join([f"{r:.2f}" for r in rewards]) if rewards else "0.00"
+        print(
+            f"[END]   success={success_str} steps={step_num} score={final_score:.2f} rewards={rewards_str}"
+        )
+
+        # Cleanup
+        env.close()
+
+    return success, final_score
+
+
 def run_inference():
     """
-    Run the baseline inference loop.
+    Run the baseline inference loop for ALL tasks.
 
     This function:
-    1. Initializes the environment
-    2. Runs the model against the environment
-    3. Outputs structured logs in the exact required format
+    1. Initializes the OpenAI client with injected LiteLLM proxy credentials
+    2. Runs the model against EACH of the 3 tasks
+    3. Outputs structured logs in the exact required format for each task
+
+    HACKATHON REQUIREMENT: Must run all 3 tasks to pass "3+ tasks with graders" check
     """
     # ============================================
     # CONFIGURATION - Read env vars at runtime
-    # Must use the injected API_BASE_URL and API_KEY
+    # Must use the injected API_BASE_URL and API_KEY from LiteLLM proxy
     # ============================================
     api_base_url = os.environ["API_BASE_URL"]
     api_key = os.environ["API_KEY"]
@@ -122,134 +276,28 @@ def run_inference():
     # Initialize OpenAI client with injected credentials
     client = OpenAI(base_url=api_base_url, api_key=api_key)
 
-    # Initialize environment
-    env = SQLAnalystEnv()
-
-    # Reset environment and get initial observation
-    observation = env.reset()
-
-    # Get task info from state
-    state = env.state()
-    task_name = state.get("task_id", "unknown")
-
     # ============================================
-    # [START] LOG - EXACT FORMAT REQUIRED
+    # RUN ALL 3 TASKS
+    # Hackathon requires: "3+ tasks with graders"
+    # Validator: "Enumerate tasks, run each grader, verify scores"
     # ============================================
-    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={model_name}")
+    results = []
 
-    # Track rewards and steps
-    rewards = []
-    step_num = 0
-    done = False
-    success = False
-    final_score = 0.0
+    for task in TASKS:
+        task_success, task_score = run_single_task(client, model_name, task.task_id)
+        results.append((task.task_id, task_success, task_score))
 
-    while not done and step_num < MAX_STEPS:
-        step_num += 1
+    # Return overall success (all tasks passed) and average score
+    all_success = all(r[1] for r in results)
+    avg_score = sum(r[2] for r in results) / len(results) if results else 0.01
 
-        # Build the prompt
-        error_section = ""
-        if observation.error_message:
-            error_section = f"ERROR FROM LAST ACTION:\n{observation.error_message}"
-
-        prompt = SYSTEM_PROMPT.format(
-            schema_info=observation.schema_info,
-            current_question=observation.current_question,
-            last_query_result=observation.last_query_result,
-            error_section=error_section,
-        )
-
-        try:
-            # Call the model via the injected LiteLLM proxy
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a SQL expert. Respond only with valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=500,
-            )
-
-            # Extract response text
-            response_text = response.choices[0].message.content
-
-            # Parse into Action
-            action = parse_model_response(response_text)
-
-            if action is None:
-                # Failed to parse, try a simple query as fallback
-                action = Action(sql_query="SELECT 1")
-                error_msg = "parse_error"
-            else:
-                error_msg = "null"
-
-            # Execute action in environment
-            observation, reward, done, info = env.step(action)
-
-            # Track reward
-            reward_value = reward.value
-            rewards.append(reward_value)
-
-            # Check for errors in observation
-            if observation.error_message:
-                error_msg = observation.error_message.replace("\n", " ")[:50]
-
-            # ============================================
-            # [STEP] LOG - EXACT FORMAT REQUIRED
-            # ============================================
-            action_str = format_action_str(action)
-            done_str = "true" if done else "false"
-            print(
-                f"[STEP]  step={step_num} action={action_str} reward={reward_value:.2f} done={done_str} error={error_msg}"
-            )
-
-            # Update final results
-            if done:
-                success = info.get("success", False)
-                final_score = info.get("final_score", 0.0)
-
-        except Exception as e:
-            # Handle API or other errors
-            error_msg = str(e).replace("\n", " ")[:50]
-            print(
-                f"[STEP]  step={step_num} action=error reward=0.00 done=false error={error_msg}"
-            )
-            rewards.append(0.0)
-
-            # Try to continue with a simple action
-            try:
-                action = Action(submit_answer="error")
-                observation, reward, done, info = env.step(action)
-                success = info.get("success", False)
-                final_score = info.get("final_score", 0.0)
-            except:
-                done = True
-                success = False
-                final_score = 0.0
-
-    # ============================================
-    # [END] LOG - EXACT FORMAT REQUIRED
-    # ============================================
-    success_str = "true" if success else "false"
-    rewards_str = ",".join([f"{r:.2f}" for r in rewards])
-    print(
-        f"[END]   success={success_str} steps={step_num} score={final_score:.2f} rewards={rewards_str}"
-    )
-
-    # Cleanup
-    env.close()
-
-    return success, final_score
+    return all_success, avg_score
 
 
 def main():
     """Main entry point."""
-    # DO NOT catch exceptions here - let them propagate
-    # so the validator can see real errors
+    # Let exceptions propagate so validator can see real errors
+    # But ensure [END] is always emitted (handled in run_single_task via finally)
     success, score = run_inference()
     sys.exit(0)
 
