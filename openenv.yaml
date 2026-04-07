@@ -96,3 +96,30 @@ endpoints:
     method: GET
     path: /state
     description: Get the current internal state of the environment
+
+# Task definitions with graders for hackathon validation
+# Each task has a unique ID, description, difficulty, and grader function
+tasks:
+  - task_id: easy_user_count
+    description: "Count the total number of users in the database"
+    difficulty: easy
+    question: "How many users are registered in the system? Provide the total count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 15
+    max_steps: 15
+
+  - task_id: medium_usa_revenue
+    description: "Calculate total revenue from USA customers using JOIN"
+    difficulty: medium
+    question: "What is the total revenue (sum of total_amount) from purchases made by users in the USA? Provide the total as a number (rounded to 2 decimal places if needed)."
+    grader: environment.graders:grade_answer
+    ground_truth: 2423.87
+    max_steps: 15
+
+  - task_id: hard_top_spender
+    description: "Find the top spending user using complex aggregation"
+    difficulty: hard
+    question: "Who is the top spender (user with highest total purchase amount)? Provide the username of the user who spent the most money in total."
+    grader: environment.graders:grade_answer
+    ground_truth: "alice"
+    max_steps: 15
