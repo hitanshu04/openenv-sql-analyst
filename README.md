@@ -86,9 +86,9 @@ The environment implements precise partial reward signals to guide learning:
 | Incorrect answer submitted | `0.0` | **Yes** |
 
 **Final Score Calculation**: 
-- If incorrect: `score = 0.0`
-- If correct: `score = 0.7 + (1 - steps/15) * 0.3`
-- Score range: `0.0` to `1.0`
+- If incorrect: `score = 0.01`
+- If correct: `score = 0.7 + (1 - steps/15) * 0.28`
+- Score range: strictly between `0.01` and `0.99` (never exactly 0 or 1)
 
 ---
 
