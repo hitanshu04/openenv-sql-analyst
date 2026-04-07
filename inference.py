@@ -1,257 +1,203 @@
-#!/usr/bin/env python3
-# inference.py
-# Baseline Inference Script for OpenEnv SQL Analyst
-# Uses OpenAI API client to run model against the environment
-
 import os
-import sys
+import re
 import json
-from typing import Optional
-
-# Add the project root to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+import textwrap
+from typing import List
 from openai import OpenAI
-from environment.env import SQLAnalystEnv
-from environment.models import Action
+from client import SQLAnalystClient
+from env import Action as SQLAction
 
+DEBUG = True
+ACTION_PREFIX_RE = re.compile(
+    r"^(action|next action)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+ACTION_PATTERN = re.compile(r"[A-Za-z_]+\s*\(.*\)", re.DOTALL)
+FALLBACK_ACTION = "noop()"
+MAX_STEPS = 20
 
-# Environment configuration
-BENCHMARK_NAME = "sql_analyst"
-MAX_STEPS = 15
-
-
-# ============================================
-# SYSTEM PROMPT
-# ============================================
-SYSTEM_PROMPT = """You are an expert SQL Data Analyst AI agent. Your task is to answer business questions by querying a SQLite database.
-
-You have two possible actions each turn:
-1. Execute a SQL query to explore the data: {{"sql_query": "SELECT ..."}}
-2. Submit your final answer: {{"submit_answer": "your answer"}}
-
-IMPORTANT RULES:
-- Only use SELECT queries. INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE are blocked.
-- Explore the data step by step before submitting your final answer.
-- Your final answer should be just the value requested (a number, name, etc.), not a SQL query.
-- Respond with ONLY a valid JSON object, no other text.
-
-DATABASE SCHEMA:
-{schema_info}
-
-CURRENT QUESTION:
-{current_question}
-
-LAST QUERY RESULT:
-{last_query_result}
-
-{error_section}
-
-Respond with a JSON object containing either "sql_query" or "submit_answer"."""
-
-
-def format_action_str(action: Action) -> str:
-    """Format action for logging."""
-    if action.sql_query:
-        # Truncate long queries for logging
-        query = action.sql_query.replace("\n", " ").strip()
-        if len(query) > 50:
-            query = query[:47] + "..."
-        return f"sql_query={query}"
-    elif action.submit_answer:
-        answer = str(action.submit_answer).strip()
-        if len(answer) > 30:
-            answer = answer[:27] + "..."
-        return f"submit_answer={answer}"
-    return "invalid_action"
-
-
-def parse_model_response(response_text: str) -> Optional[Action]:
+SYSTEM_PROMPT = textwrap.dedent(
     """
-    Parse the model's response into an Action.
-
-    Args:
-        response_text: The raw text response from the model
-
-    Returns:
-        Action or None if parsing fails
+    You are a SQL Data Analyst Agent.
+    Your goal is to answer business questions by writing and executing SQL queries.
+    Reply with exactly one action string.
+    The action must be a valid SQL command such as:
+    - execute_sql('SELECT * FROM users')
+    - submit_answer('42')
+    - noop()
+    Use single quotes around string arguments.
+    Do not include explanations or additional text.
     """
-    try:
-        # Clean the response
-        text = response_text.strip()
-
-        # Try to extract JSON from the response
-        # Handle cases where model wraps JSON in markdown code blocks
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.find("```") + 3
-            end = text.find("```", start)
-            text = text[start:end].strip()
-
-        # Parse JSON
-        data = json.loads(text)
-
-        # Create Action
-        return Action(
-            sql_query=data.get("sql_query"), submit_answer=data.get("submit_answer")
-        )
-    except (json.JSONDecodeError, ValueError):
-        return None
+).strip()
 
 
-def run_inference():
-    """
-    Run the baseline inference loop.
+def build_history_lines(history: List[str]) -> str:
+    if not history:
+        return "None"
+    return "\n".join(history[-4:])
 
-    This function:
-    1. Initializes the environment
-    2. Runs the model against the environment
-    3. Outputs structured logs in the exact required format
-    """
-    # ============================================
-    # CONFIGURATION - Read env vars at runtime
-    # Must use the injected API_BASE_URL and API_KEY
-    # ============================================
-    api_base_url = os.environ["API_BASE_URL"]
-    api_key = os.environ["API_KEY"]
-    model_name = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 
-    # Initialize OpenAI client with injected credentials
-    client = OpenAI(base_url=api_base_url, api_key=api_key)
-
-    # Initialize environment
-    env = SQLAnalystEnv()
-
-    # Reset environment and get initial observation
-    observation = env.reset()
-
-    # Get task info from state
-    state = env.state()
-    task_name = state.get("task_id", "unknown")
-
-    # ============================================
-    # [START] LOG - EXACT FORMAT REQUIRED
-    # ============================================
-    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={model_name}")
-
-    # Track rewards and steps
-    rewards = []
-    step_num = 0
-    done = False
-    success = False
-    final_score = 0.0
-
-    while not done and step_num < MAX_STEPS:
-        step_num += 1
-
-        # Build the prompt
-        error_section = ""
-        if observation.error_message:
-            error_section = f"ERROR FROM LAST ACTION:\n{observation.error_message}"
-
-        prompt = SYSTEM_PROMPT.format(
-            schema_info=observation.schema_info,
-            current_question=observation.current_question,
-            last_query_result=observation.last_query_result,
-            error_section=error_section,
-        )
-
-        try:
-            # Call the model via the injected LiteLLM proxy
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a SQL expert. Respond only with valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=500,
-            )
-
-            # Extract response text
-            response_text = response.choices[0].message.content
-
-            # Parse into Action
-            action = parse_model_response(response_text)
-
-            if action is None:
-                # Failed to parse, try a simple query as fallback
-                action = Action(sql_query="SELECT 1")
-                error_msg = "parse_error"
-            else:
-                error_msg = "null"
-
-            # Execute action in environment
-            observation, reward, done, info = env.step(action)
-
-            # Track reward
-            reward_value = reward.value
-            rewards.append(reward_value)
-
-            # Check for errors in observation
-            if observation.error_message:
-                error_msg = observation.error_message.replace("\n", " ")[:50]
-
-            # ============================================
-            # [STEP] LOG - EXACT FORMAT REQUIRED
-            # ============================================
-            action_str = format_action_str(action)
-            done_str = "true" if done else "false"
-            print(
-                f"[STEP]  step={step_num} action={action_str} reward={reward_value:.2f} done={done_str} error={error_msg}"
-            )
-
-            # Update final results
-            if done:
-                success = info.get("success", False)
-                final_score = info.get("final_score", 0.0)
-
-        except Exception as e:
-            # Handle API or other errors
-            error_msg = str(e).replace("\n", " ")[:50]
-            print(
-                f"[STEP]  step={step_num} action=error reward=0.00 done=false error={error_msg}"
-            )
-            rewards.append(0.0)
-
-            # Try to continue with a simple action
-            try:
-                action = Action(submit_answer="error")
-                observation, reward, done, info = env.step(action)
-                success = info.get("success", False)
-                final_score = info.get("final_score", 0.0)
-            except:
-                done = True
-                success = False
-                final_score = 0.0
-
-    # ============================================
-    # [END] LOG - EXACT FORMAT REQUIRED
-    # ============================================
-    success_str = "true" if success else "false"
-    rewards_str = ",".join([f"{r:.2f}" for r in rewards])
-    print(
-        f"[END]   success={success_str} steps={step_num} score={final_score:.2f} rewards={rewards_str}"
+def build_user_prompt(step: int, observation, history: List[str]) -> str:
+    goal = getattr(
+        observation, "question", observation.get("question", "(not provided)")
     )
+    schema = getattr(
+        observation,
+        "schema_summary",
+        observation.get("schema_summary", "(none detected)"),
+    )
+    last_error = getattr(observation, "last_error", observation.get("last_error", None))
+    error_note = "Yes" if last_error else "No"
 
-    # Cleanup
-    env.close()
+    prompt = textwrap.dedent(
+        f"""
+        Step: {step}
+        Goal: {goal}
+        Database Schema: {schema}
+        Previous steps:
+        {build_history_lines(history)}
+        Last action error: {error_note}
+        Reply with exactly one SQL action string.
+        """
+    ).strip()
+    return prompt
 
-    return success, final_score
+
+def parse_model_action(response_text: str) -> str:
+    if not response_text:
+        return FALLBACK_ACTION
+
+    lines = response_text.splitlines()
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = ACTION_PREFIX_RE.sub("", line)
+        match = ACTION_PATTERN.search(line)
+        if match:
+            action = match.group(0).strip()
+            action = re.sub(r"\s+", " ", action)
+            return action
+
+    match = ACTION_PATTERN.search(response_text)
+    if match:
+        action = match.group(0).strip()
+        action = re.sub(r"\s+", " ", action)
+        return action
+
+    return FALLBACK_ACTION
+
+
+def extract_sql_or_answer(action_str: str):
+    """Extract sql_query or submit_answer from action string like execute_sql('SELECT...')"""
+    action_str = action_str.strip()
+
+    if action_str.startswith("execute_sql(") or action_str.startswith("submit_answer("):
+        match = re.search(r"\((.*)\)", action_str)
+        if match:
+            content = match.group(1).strip()
+            # Remove outer quotes if present
+            if (content.startswith("'") and content.endswith("'")) or (
+                content.startswith('"') and content.endswith('"')
+            ):
+                content = content[1:-1]
+
+            if action_str.startswith("execute_sql("):
+                return content, None
+            else:
+                return None, content
+
+    if action_str == "noop()":
+        return None, None
+
+    # Default: treat as SQL query
+    return action_str, None
 
 
 def main():
-    """Main entry point."""
-    # DO NOT catch exceptions here - let them propagate
-    # so the validator can see real errors
-    success, score = run_inference()
-    sys.exit(0)
+    api_key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+    model_name = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+    env_url = os.environ.get("OPENENV_URL")
+
+    if not api_key:
+        print("Error: Set API_KEY, HF_TOKEN, or OPENAI_API_KEY environment variable")
+        return
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    tasks = ["monthly_signups", "top_revenue_category", "churn_analysis"]
+
+    for task_id in tasks:
+        print(
+            f" {json.dumps({'task_id': task_id, 'task_name': task_id, 'difficulty': 'curriculum'})}"
+        )
+
+        history: List[str] = []
+
+        # Use local environment instead of HTTP
+        from env import SQLAnalystEnv as LocalEnv
+
+        env = LocalEnv(task_id=task_id)
+        result = env.reset()
+        observation = result.observation
+        total_reward = 0.0
+
+        for step in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
+
+            user_prompt = build_user_prompt(step, observation, history)
+
+            try:
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.0,
+                )
+                response_text = completion.choices[0].message.content or ""
+            except Exception as exc:
+                print(f"Model request failed ({exc}). Using fallback action.")
+                response_text = FALLBACK_ACTION
+
+            action_str = parse_model_action(response_text)
+
+            sql_query, submit_answer = extract_sql_or_answer(action_str)
+
+            if submit_answer:
+                action = SQLAction(submit_answer=submit_answer)
+            elif sql_query:
+                action = SQLAction(sql_query=sql_query)
+            else:
+                action = SQLAction(sql_query="SELECT 1")
+
+            result = env.step(action)
+            observation = result.observation
+            reward = result.reward or 0.0
+            total_reward += reward
+
+            print(
+                f" {json.dumps({'step': step, 'action': action_str, 'reward': reward, 'done': result.done})}"
+            )
+
+            error_flag = " ERROR" if observation.last_error else ""
+            history_line = (
+                f"Step {step}: {action_str} -> reward {reward:+.2f}{error_flag}"
+            )
+            history.append(history_line)
+
+        print(
+            f" {json.dumps({'total_steps': step, 'final_reward': total_reward, 'task_score': result.info.get('task_score', 0.0)})}"
+        )
+
+        avg_score = total_reward
+        print(f"\n{'=' * 60}")
+        print(f"TASK: {task_id}")
+        print(f"FINAL REWARD: {avg_score:.3f}")
+        print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":
