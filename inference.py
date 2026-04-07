@@ -21,7 +21,7 @@ from environment.models import Action
 # ============================================
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-API_KEY = os.environ.get("HF_TOKEN")
+API_KEY = os.environ.get("API_KEY")
 
 # Environment configuration
 BENCHMARK_NAME = "sql_analyst"

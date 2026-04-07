@@ -191,8 +191,8 @@ chmod +x validate.sh
 
 ```bash
 # Set environment variables
-export HF_TOKEN="your-huggingface-token"
-export API_BASE_URL="https://api.openai.com/v1"  # or HF inference endpoint
+export API_KEY="your-api-key"
+export API_BASE_URL="https://api.openai.com/v1"  # or LiteLLM proxy endpoint
 export MODEL_NAME="gpt-4o-mini"
 
 # Run inference
@@ -203,7 +203,7 @@ python inference.py
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HF_TOKEN` | HuggingFace API token (used as API key) | Required for inference |
+| `API_KEY` | API key for LLM provider (injected by hackathon) | Required for inference |
 | `API_BASE_URL` | OpenAI-compatible API endpoint | `https://api.openai.com/v1` |
 | `MODEL_NAME` | Model identifier | `gpt-4o-mini` |
 
