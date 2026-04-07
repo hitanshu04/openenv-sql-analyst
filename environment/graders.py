@@ -141,34 +141,6 @@ def grade_sql_result(
 
     return False, 0.01
 
-    # Parse the query result to extract values
-    # Result format is markdown table: | col1 | col2 |
-    lines = query_result.strip().split("\n")
-
-    # Skip header and separator lines
-    data_lines = [l for l in lines if l.strip() and not l.startswith("|---")]
-
-    if len(data_lines) < 2:  # Need at least header + 1 data row
-        return False, 0.0
-
-    # Get the first data row (skip header)
-    data_row = data_lines[1] if len(data_lines) > 1 else ""
-
-    # Extract values from the row
-    values = [v.strip() for v in data_row.split("|") if v.strip()]
-
-    if not values:
-        return False, 0.0
-
-    # For single-value answers, compare the first value
-    # For multi-column results, try each value
-    for value in values:
-        is_correct, score = compare_values(value, ground_truth)
-        if is_correct:
-            return True, score
-
-    return False, 0.0
-
 
 def grade_answer(
     submitted_answer: str, ground_truth: Any, db_engine: Any = None
