@@ -27,8 +27,8 @@ MAX_STEPS = 15
 SYSTEM_PROMPT = """You are an expert SQL Data Analyst AI agent. Your task is to answer business questions by querying a SQLite database.
 
 You have two possible actions each turn:
-1. Execute a SQL query to explore the data: {"sql_query": "SELECT ..."}
-2. Submit your final answer: {"submit_answer": "your answer"}
+1. Execute a SQL query to explore the data: {{"sql_query": "SELECT ..."}}
+2. Submit your final answer: {{"submit_answer": "your answer"}}
 
 IMPORTANT RULES:
 - Only use SELECT queries. INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE are blocked.
