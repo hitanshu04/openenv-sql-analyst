@@ -16,13 +16,6 @@ from environment.env import SQLAnalystEnv
 from environment.models import Action
 
 
-# ============================================
-# CONFIGURATION - MUST USE INJECTED ENV VARS
-# ============================================
-API_BASE_URL = os.environ["API_BASE_URL"]  # Required - no default
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-API_KEY = os.environ["API_KEY"]  # Required - no default
-
 # Environment configuration
 BENCHMARK_NAME = "sql_analyst"
 MAX_STEPS = 15
@@ -105,7 +98,7 @@ def parse_model_response(response_text: str) -> Optional[Action]:
         return Action(
             sql_query=data.get("sql_query"), submit_answer=data.get("submit_answer")
         )
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError):
         return None
 
 
@@ -118,8 +111,16 @@ def run_inference():
     2. Runs the model against the environment
     3. Outputs structured logs in the exact required format
     """
+    # ============================================
+    # CONFIGURATION - Read env vars at runtime
+    # Must use the injected API_BASE_URL and API_KEY
+    # ============================================
+    api_base_url = os.environ["API_BASE_URL"]
+    api_key = os.environ["API_KEY"]
+    model_name = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
     # Initialize OpenAI client with injected credentials
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=api_base_url, api_key=api_key)
 
     # Initialize environment
     env = SQLAnalystEnv()
@@ -134,7 +135,7 @@ def run_inference():
     # ============================================
     # [START] LOG - EXACT FORMAT REQUIRED
     # ============================================
-    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={MODEL_NAME}")
+    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={model_name}")
 
     # Track rewards and steps
     rewards = []
@@ -159,9 +160,9 @@ def run_inference():
         )
 
         try:
-            # Call the model
+            # Call the model via the injected LiteLLM proxy
             response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model_name,
                 messages=[
                     {
                         "role": "system",
@@ -247,15 +248,10 @@ def run_inference():
 
 def main():
     """Main entry point."""
-    try:
-        success, score = run_inference()
-        sys.exit(0 if success else 0)  # Always exit 0 for validation script
-    except Exception as e:
-        # Emergency fallback - still output required logs
-        print(f"[START] task=error env={BENCHMARK_NAME} model={MODEL_NAME}")
-        print(f"[STEP]  step=1 action=error reward=0.00 done=true error={str(e)[:50]}")
-        print(f"[END]   success=false steps=1 score=0.00 rewards=0.00")
-        sys.exit(0)
+    # DO NOT catch exceptions here - let them propagate
+    # so the validator can see real errors
+    success, score = run_inference()
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -203,8 +203,8 @@ python inference.py
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `API_KEY` | API key for LLM provider (injected by hackathon) | Required for inference |
-| `API_BASE_URL` | OpenAI-compatible API endpoint | `https://api.openai.com/v1` |
+| `API_KEY` | API key for LLM provider (injected by hackathon) | **Required** |
+| `API_BASE_URL` | OpenAI-compatible API endpoint (injected by hackathon) | **Required** |
 | `MODEL_NAME` | Model identifier | `gpt-4o-mini` |
 
 ### Validation Gates
