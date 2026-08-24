@@ -3,7 +3,7 @@
 # Implements type-agnostic normalization and SQL evaluation
 # IMPORTANT: All scores must be STRICTLY between 0 and 1 (not 0.0, not 1.0)
 
-from typing import Any, Tuple, Optional
+from typing import Any, List, Optional, Tuple
 import re
 
 
@@ -79,13 +79,57 @@ def extract_numeric(value: str) -> Optional[float]:
         return None
 
 
-def compare_values(submitted: Any, ground_truth: Any) -> Tuple[bool, float]:
+def contains_whole_word(text: Any, word: Any) -> bool:
+    """
+    Check whether `word` appears in `text` as a standalone token.
+
+    Used instead of plain substring containment so a ground truth of "alice"
+    is not matched by "malice".
+    """
+    pattern = rf"(?<!\w){re.escape(str(word).strip().lower())}(?!\w)"
+    return re.search(pattern, str(text).lower()) is not None
+
+
+def count_domain_matches(text: Any, answer_domain: List[Any]) -> int:
+    """
+    Count how many distinct candidate answers appear in a submission.
+
+    A final answer is singular by definition. An agent that names several
+    candidates from the answer domain is hedging, not answering, and must not
+    score full credit merely for having the right one somewhere in the list.
+
+    Args:
+        text: The agent's submitted answer
+        answer_domain: Every value the answer could legitimately take
+
+    Returns:
+        int: Number of distinct domain values present as whole words
+    """
+    return sum(1 for candidate in set(answer_domain) if contains_whole_word(text, candidate))
+
+
+def compare_values(
+    submitted: Any, ground_truth: Any, answer_domain: Optional[List[Any]] = None
+) -> Tuple[bool, float]:
     """
     Compare submitted answer to ground truth.
+
+    Matching is deliberately ordered from strictest to loosest:
+      1. exact match after normalization
+      2. numeric comparison with tolerance and partial credit
+      3. whole-word containment, so a natural-language answer such as
+         "The top spender is alice." still counts
+
+    Step 3 is guarded: if the submission names more than one value from
+    `answer_domain`, it is a guess-list rather than an answer and is rejected.
+    Without that guard an agent can submit every candidate and score full
+    marks, which is reward hacking rather than analysis.
 
     Args:
         submitted: The agent's submitted answer
         ground_truth: The expected correct answer
+        answer_domain: Optional set of legitimate candidate answers, used to
+            detect hedging. Only meaningful for categorical answers.
 
     Returns:
         Tuple[bool, float]: (is_correct, score)
@@ -96,11 +140,11 @@ def compare_values(submitted: Any, ground_truth: Any) -> Tuple[bool, float]:
     norm_submitted = normalize_value(submitted)
     norm_truth = normalize_value(ground_truth)
 
-    # Direct string comparison after normalization
+    # 1. Direct string comparison after normalization
     if norm_submitted == norm_truth:
         return True, MAX_SCORE  # 0.99 instead of 1.0
 
-    # Try numeric comparison for numeric ground truths
+    # 2. Try numeric comparison for numeric ground truths
     if isinstance(ground_truth, (int, float)):
         submitted_num = extract_numeric(submitted)
         if submitted_num is not None:
@@ -114,8 +158,10 @@ def compare_values(submitted: Any, ground_truth: Any) -> Tuple[bool, float]:
                 if error_pct < 0.1:
                     return False, 0.5
 
-    # Check if submitted answer contains the ground truth
-    if norm_truth in norm_submitted:
+    # 3. Whole-word containment, rejected if the answer hedges across candidates
+    if contains_whole_word(submitted, ground_truth):
+        if answer_domain and count_domain_matches(submitted, answer_domain) > 1:
+            return False, MIN_SCORE  # listing every option is not answering
         return True, MAX_SCORE  # 0.99 instead of 1.0
 
     return False, MIN_SCORE  # 0.01 instead of 0.0
@@ -171,7 +217,10 @@ def grade_sql_result(
 
 
 def grade_answer(
-    submitted_answer: str, ground_truth: Any, db_engine: Any = None
+    submitted_answer: str,
+    ground_truth: Any,
+    db_engine: Any = None,
+    answer_domain: Optional[List[Any]] = None,
 ) -> Tuple[bool, float]:
     """
     Grade the agent's submitted answer.
@@ -199,15 +248,15 @@ def grade_answer(
 
     if is_sql_query and db_engine is not None:
         # Execute the SQL and grade the result
-        result, is_error = db_engine.execute_query(submitted)
-        return grade_sql_result(result, ground_truth, is_error)
+        result, status = db_engine.execute_query(submitted)
+        return grade_sql_result(result, ground_truth, status != "ok")
 
     # Direct answer comparison
-    return compare_values(submitted, ground_truth)
+    return compare_values(submitted, ground_truth, answer_domain)
 
 
 def calculate_final_score(
-    is_correct: bool, total_steps: int, max_steps: int = 15
+    is_correct: bool, grading_score: float, total_steps: int, max_steps: int = 15
 ) -> float:
     """
     Calculate the final score for a task.
@@ -215,9 +264,13 @@ def calculate_final_score(
     Scoring factors:
     - Correctness is primary
     - Efficiency bonus for fewer steps
+    - Partial credit is preserved for near-miss numeric answers
 
     Args:
         is_correct: Whether the answer was correct
+        grading_score: Score returned by the grader. For an incorrect answer
+            this carries any partial credit (e.g. 0.5 for within 10%), which
+            would otherwise be computed and then discarded.
         total_steps: Number of steps taken
         max_steps: Maximum allowed steps
 
@@ -225,7 +278,9 @@ def calculate_final_score(
         float: Final score STRICTLY between 0 and 1
     """
     if not is_correct:
-        return MIN_SCORE  # 0.01 instead of 0.0
+        # Honour the grader's partial credit instead of flattening every
+        # wrong answer to the minimum score.
+        return clamp_score(grading_score)
 
     # Base score for correct answer
     base_score = 0.7
