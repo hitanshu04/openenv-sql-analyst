@@ -5,8 +5,14 @@
 from typing import Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 from .models import Action, Observation, Reward
-from .db_engine import DatabaseEngine
-from .tasks import Task, get_random_task, TASKS
+from .db_engine import DatabaseEngine, QueryStatus
+from .tasks import (
+    Task,
+    TASKS,
+    get_random_task,
+    resolve_answer_domain,
+    resolve_ground_truth,
+)
 from .graders import grade_answer, calculate_final_score
 
 # Try to import openenv.BaseEnv, fallback to a simple base class if not available
@@ -38,6 +44,10 @@ class EnvironmentState:
     
     Attributes:
         task: The current task being solved
+        ground_truth: Answer derived from the task's reference SQL at reset
+        answer_domain: Legitimate candidate answers, used to reject hedging
+        seed: Seed used for this episode, echoed back for reproducibility
+        episode_id: Optional caller-supplied episode identifier
         step_count: Number of steps taken in current episode
         done: Whether the episode has ended
         last_query_result: Result from the most recent SQL query
@@ -47,6 +57,10 @@ class EnvironmentState:
         success: Whether the task was completed successfully
     """
     task: Optional[Task] = None
+    ground_truth: Any = None
+    answer_domain: Optional[list] = None
+    seed: Optional[int] = None
+    episode_id: Optional[str] = None
     step_count: int = 0
     done: bool = False
     last_query_result: str = ""
@@ -81,25 +95,38 @@ class SQLAnalystEnv(BaseEnv):
         self.db_engine = DatabaseEngine()
         self._state = EnvironmentState()
     
-    def reset(self, task_id: Optional[str] = None) -> Observation:
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        task_id: Optional[str] = None,
+        episode_id: Optional[str] = None,
+        **kwargs,
+    ) -> Observation:
         """
         Reset the environment to start a new episode.
-        
+
         This method:
         1. Initializes a clean in-memory SQLite database
-        2. Randomly selects 1 of the 3 tasks (or uses specified task)
+        2. Selects 1 of the 3 tasks (specified, or drawn from a seeded RNG)
         3. Resets step_count to 0
         4. Returns the initial observation
-        
+
         Args:
+            seed: Optional seed making task selection reproducible. Matches the
+                OpenEnv reset(seed=..., episode_id=...) interface; without it,
+                episodes could not be replayed.
             task_id: Optional specific task to use
-            
+            episode_id: Optional caller-supplied episode identifier
+
         Returns:
             Observation: The initial observation for the episode
         """
         # Initialize clean database
         self.db_engine.initialize()
-        
+
+        self._state.seed = seed
+        self._state.episode_id = episode_id
+
         # Select task
         if task_id:
             for task in TASKS:
@@ -107,10 +134,15 @@ class SQLAnalystEnv(BaseEnv):
                     self._state.task = task
                     break
             else:
-                self._state.task = get_random_task()
+                self._state.task = get_random_task(seed=seed)
         else:
-            self._state.task = get_random_task()
-        
+            self._state.task = get_random_task(seed=seed)
+
+        # Derive the correct answer from the task's own reference SQL, against
+        # the same data the agent will query. Ground truth cannot drift.
+        self._state.ground_truth = resolve_ground_truth(self._state.task, self.db_engine)
+        self._state.answer_domain = resolve_answer_domain(self._state.task, self.db_engine)
+
         # Reset state
         self._state.step_count = 0
         self._state.done = False
@@ -153,28 +185,32 @@ class SQLAnalystEnv(BaseEnv):
         if self._state.done:
             # Episode already ended
             return self._get_observation(), Reward(value=0.0), True, self._get_info()
-        
+
         # Increment step count
         self._state.step_count += 1
-        
-        # Check for infinite loop shield FIRST
-        if self._state.step_count >= MAX_STEPS:
-            self._state.done = True
-            self._state.error_message = f"Maximum steps ({MAX_STEPS}) reached. Episode terminated."
-            reward = REWARD_INFINITE_LOOP
-            self._state.rewards.append(reward)
-            return self._get_observation(), Reward(value=reward), True, self._get_info()
-        
+
         # Initialize reward for this step
         reward = 0.0
         self._state.error_message = ""
-        
-        # Process action
+
+        # Process action. The action is executed BEFORE the loop shield is
+        # considered, so the agent gets all MAX_STEPS actions -- previously the
+        # shield fired first and silently discarded the final action, leaving
+        # only MAX_STEPS - 1 usable.
         if action.sql_query:
             reward = self._handle_sql_query(action.sql_query)
         elif action.submit_answer:
             reward = self._handle_submit_answer(action.submit_answer)
-        
+
+        # Infinite loop shield: the agent has now used its full step budget
+        # without terminating on its own.
+        if not self._state.done and self._state.step_count >= MAX_STEPS:
+            self._state.done = True
+            self._state.error_message = (
+                f"Maximum steps ({MAX_STEPS}) reached. Episode terminated."
+            )
+            reward = REWARD_INFINITE_LOOP
+
         # Record reward
         self._state.rewards.append(reward)
         
@@ -190,22 +226,20 @@ class SQLAnalystEnv(BaseEnv):
         Returns:
             float: The reward for this action
         """
-        # Check for destructive action first
-        mutation_error = self.db_engine.check_mutation(query)
-        if mutation_error:
+        result, status = self.db_engine.execute_query(query)
+
+        # SQLite's authorizer refused a write/attach/pragma: destructive intent.
+        if status == QueryStatus.DENIED:
             self._state.done = True
-            self._state.error_message = mutation_error
+            self._state.error_message = result
             self._state.last_query_result = ""
             return REWARD_DESTRUCTIVE_ACTION
-        
-        # Execute the query
-        result, is_error = self.db_engine.execute_query(query)
-        
-        if is_error:
+
+        if status == QueryStatus.ERROR:
             self._state.error_message = result
             self._state.last_query_result = ""
             return REWARD_SYNTAX_ERROR
-        
+
         # Successful query
         self._state.last_query_result = result
         self._state.error_message = ""
@@ -224,17 +258,20 @@ class SQLAnalystEnv(BaseEnv):
         # Episode ends when answer is submitted
         self._state.done = True
         
-        # Grade the answer
+        # Grade the answer against the ground truth derived at reset()
         is_correct, grading_score = grade_answer(
             answer,
-            self._state.task.ground_truth,
-            self.db_engine
+            self._state.ground_truth,
+            self.db_engine,
+            self._state.answer_domain,
         )
-        
-        # Calculate final score
+
+        # Calculate final score. grading_score carries the grader's partial
+        # credit for near-miss numeric answers, which the score must honour.
         self._state.success = is_correct
         self._state.final_score = calculate_final_score(
             is_correct,
+            grading_score,
             self._state.step_count,
             MAX_STEPS
         )
@@ -288,6 +325,8 @@ class SQLAnalystEnv(BaseEnv):
             "task_id": self._state.task.task_id if self._state.task else None,
             "task_difficulty": self._state.task.difficulty if self._state.task else None,
             "task_question": self._state.task.question if self._state.task else None,
+            "seed": self._state.seed,
+            "episode_id": self._state.episode_id,
             "step_count": self._state.step_count,
             "done": self._state.done,
             "last_query_result": self._state.last_query_result,
