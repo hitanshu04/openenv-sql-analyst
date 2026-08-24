@@ -19,6 +19,15 @@ tags:
 
 **OpenEnv Hackathon Submission** | Meta x Scaler
 
+<p align="center">
+  <img src="docs/demo.gif" alt="An agent solving a task in the environment: reward shaping, read-only enforcement, grading, and seeded replay" width="100%">
+</p>
+
+<p align="center">
+  <em>Reproduce this in ten seconds — no API key, no model, no network:</em>
+  <code>python demo.py</code>
+</p>
+
 ---
 
 ## How It Works
@@ -276,17 +285,21 @@ python inference.py
 ### See It Run (no API key needed)
 
 ```bash
-python demo.py
+python demo.py             # instant
+python demo.py --replay    # paced, for screen recording
 ```
 
-Real output, not an illustration — this is what the command prints:
+Real output, not an illustration — this is what the command prints. Colour is
+emitted only when stdout is a terminal, so piping to a file (as here) yields
+clean text and CI logs stay readable.
 
 ```text
 ====================================================================
 1. A COMPLETE EPISODE  (task: hard_top_spender)
 ====================================================================
 
-  Question: Who is the top spender (user with highest total purchase amount)?
+  Question: Who is the top spender (user with highest total purchase amount)? Provide the username
+            of the user who spent the most money in total.
   Ground truth, derived from the task's own reference SQL: 'alice'
 
   step 1  explore the users table            reward=+0.10  done=false
@@ -297,17 +310,22 @@ Real output, not an illustration — this is what the command prints:
           -> | username | spend | |---|---| | alice | 15...
   step 4  submit the answer                  reward=+1.00  done=true
 
-  success=True  final_score=0.91  total_reward=+1.10
+  step        1      2      3      4
+  reward  +0.10  -0.10  +0.10  +1.00
+              ▃      ▃      ▃      █
+  cum.     0.10   0.00   0.10   1.10
+
+  success   final_score=0.91   total_reward=+1.10
 
 ====================================================================
 2. READ-ONLY ENFORCEMENT  (SQLite authorizer, not a regex)
 ====================================================================
 
   REFUSED          DELETE FROM users                              (classic mutation)
-  REFUSED          REPLACE INTO users ...                         (bypasses a keyword denylist)
-  REFUSED          CREATE TABLE evil AS SELECT * FROM users       (bypasses a keyword denylist)
-  REFUSED          ATTACH DATABASE ':memory:' AS side             (bypasses a keyword denylist)
-  REFUSED          PRAGMA query_only = OFF                        (would defeat PRAGMA read-only)
+  REFUSED          REPLACE INTO users (user_id,username,email,c   (regex denylist misses it)
+  REFUSED          CREATE TABLE evil AS SELECT * FROM users       (regex denylist misses it)
+  REFUSED          ATTACH DATABASE ':memory:' AS side             (regex denylist misses it)
+  REFUSED          PRAGMA query_only = OFF                        (defeats PRAGMA read-only)
 
   ALLOWED          a legitimate SELECT with 'drop table' in a string literal
 
@@ -315,18 +333,25 @@ Real output, not an illustration — this is what the command prints:
 3. THE GRADER CANNOT BE GAMED
 ====================================================================
 
-  correct    score=0.96  alice                                    (the exact answer)
-  correct    score=0.96  The top spender is alice.                (a natural-language answer)
-  REJECTED   score=0.01  alice bob charlie diana eve frank grace  (every candidate at once)
+  correct   score=0.96  alice                                        (the exact answer)
+  correct   score=0.96  The top spender is alice.                    (a natural-language answer)
+  REJECTED  score=0.01  alice bob charlie diana eve frank grace      (every candidate at once)
 
 ====================================================================
 4. SEEDED RESET REPLAYS THE SAME EPISODE
 ====================================================================
 
-  reset(seed=42)    -> task=hard_top_spender
-  reset(seed=42)    -> task=hard_top_spender
-  reset(seed=7)     -> task=medium_usa_revenue
+  reset(seed=42)              -> task=hard_top_spender
+  reset(seed=42)              -> task=hard_top_spender
+  reset(seed=7)               -> task=medium_usa_revenue
 ```
+
+**Reading the reward trace.** The `step / reward / cum.` block is the shaping
+signal the agent actually learns from. A syntax error costs `-0.10` and pulls
+the cumulative line back down; the correct submission pays `+1.00`. Efficiency
+is priced in separately at scoring time — the same correct answer is worth less
+after more steps, which is why this episode scores `0.91` rather than the `0.96`
+a two-step solution earns.
 
 ### Running the Test Suite
 
