@@ -69,6 +69,53 @@ def format_action_str(action: Action) -> str:
     return "invalid_action"
 
 
+def extract_response_text(message) -> str:
+    """
+    Pull the usable text out of a chat completion message.
+
+    Reasoning models may return an empty `content` and place their answer in a
+    separate `reasoning` field, so a harness that reads only `content` sees
+    nothing and records a parse error on every turn. Prefer content, fall back
+    to reasoning.
+
+    Args:
+        message: The message object from a chat completion choice
+
+    Returns:
+        str: Best-effort response text, possibly empty
+    """
+    content = (getattr(message, "content", None) or "").strip()
+    if content:
+        return content
+
+    try:
+        return (message.model_dump().get("reasoning") or "").strip()
+    except Exception:
+        return ""
+
+
+def iter_json_objects(text: str):
+    """
+    Yield every balanced {...} span in `text`, outermost first.
+
+    Models wrap JSON in prose, in markdown fences, or in reasoning narration.
+    Scanning for balanced braces handles all three without needing to guess at
+    the wrapper format.
+    """
+    depth = 0
+    start = None
+    for index, char in enumerate(text):
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield text[start : index + 1]
+                start = None
+
+
 def parse_model_response(response_text: str) -> Optional[Action]:
     """
     Parse the model's response into an Action.
@@ -79,30 +126,45 @@ def parse_model_response(response_text: str) -> Optional[Action]:
     Returns:
         Action or None if parsing fails
     """
-    try:
-        # Clean the response
-        text = response_text.strip()
-
-        # Try to extract JSON from the response
-        # Handle cases where model wraps JSON in markdown code blocks
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.find("```") + 3
-            end = text.find("```", start)
-            text = text[start:end].strip()
-
-        # Parse JSON
-        data = json.loads(text)
-
-        # Create Action
-        return Action(
-            sql_query=data.get("sql_query"), submit_answer=data.get("submit_answer")
-        )
-    except (json.JSONDecodeError, ValueError):
+    if not response_text:
         return None
+
+    text = response_text.strip()
+
+    # Strip a markdown fence if the whole response is wrapped in one
+    if "```" in text:
+        fenced = text.split("```")
+        for chunk in fenced:
+            chunk = chunk.strip()
+            if chunk.startswith("json"):
+                chunk = chunk[4:].strip()
+            if chunk.startswith("{"):
+                text = chunk
+                break
+
+    # Try the whole payload first, then any balanced JSON object inside it
+    candidates = [text] + list(iter_json_objects(text))
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if not isinstance(data, dict):
+            continue
+        if data.get("sql_query") is None and data.get("submit_answer") is None:
+            continue
+
+        try:
+            return Action(
+                sql_query=data.get("sql_query"),
+                submit_answer=data.get("submit_answer"),
+            )
+        except ValueError:
+            continue
+
+    return None
 
 
 def run_single_task(
@@ -139,52 +201,99 @@ def run_single_task(
     # ============================================
     print(f"[START] task={task_name} env={BENCHMARK_NAME} model={model_name}")
 
+    # Conversation carried across turns so the agent can see what it already
+    # tried. Without this the agent has no memory between steps.
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a SQL expert. Respond only with valid JSON.",
+        },
+        {
+            "role": "user",
+            "content": SYSTEM_PROMPT.format(
+                schema_info=observation.schema_info,
+                current_question=observation.current_question,
+                last_query_result=observation.last_query_result,
+                error_section="",
+            ),
+        },
+    ]
+
     try:
         while not done and step_num < MAX_STEPS:
             step_num += 1
 
-            # Build the prompt
-            error_section = ""
-            if observation.error_message:
-                error_section = f"ERROR FROM LAST ACTION:\n{observation.error_message}"
-
-            prompt = SYSTEM_PROMPT.format(
-                schema_info=observation.schema_info,
-                current_question=observation.current_question,
-                last_query_result=observation.last_query_result,
-                error_section=error_section,
-            )
-
             try:
-                # Call the model via the injected LiteLLM proxy
+                # Call the model with the full conversation so far.
+                #
+                # Rebuilding a single-turn prompt each step (the previous
+                # behaviour) left the model with no memory of its own actions.
+                # At temperature 0 that is a deterministic loop: it re-issues
+                # the same query every turn until the step shield fires.
                 response = client.chat.completions.create(
                     model=model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a SQL expert. Respond only with valid JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
+                    messages=messages,
                     temperature=0.0,
                     max_tokens=500,
                 )
 
-                # Extract response text
-                response_text = response.choices[0].message.content
+                # Extract response text (handles reasoning models that leave
+                # `content` empty and put the payload in `reasoning`)
+                response_text = extract_response_text(response.choices[0].message)
+
+                # Record what the model said, so it can see its own history
+                messages.append(
+                    {"role": "assistant", "content": response_text or "(empty response)"}
+                )
 
                 # Parse into Action
                 action = parse_model_response(response_text)
 
                 if action is None:
-                    # Failed to parse, try a simple query as fallback
-                    action = Action(sql_query="SELECT 1")
-                    error_msg = "parse_error"
-                else:
-                    error_msg = "null"
+                    # A malformed model response must not advance the
+                    # environment. Substituting a placeholder query (the
+                    # previous behaviour) paid +0.1 for a model failure AND
+                    # fed its result back as context, which misled the model
+                    # into answering with that placeholder. Instead: surface
+                    # the parse error, score it zero, and let the model retry.
+                    # The step budget bounds how often this can happen.
+                    observation = observation.model_copy(
+                        update={
+                            "error_message": (
+                                "Your previous response was not valid JSON. Reply with "
+                                'exactly one of {"sql_query": "..."} or '
+                                '{"submit_answer": "..."} and nothing else.'
+                            )
+                        }
+                    )
+                    messages.append(
+                        {"role": "user", "content": observation.error_message}
+                    )
+                    rewards.append(0.0)
+                    print(
+                        f"[STEP]  step={step_num} action=parse_error reward=0.00 "
+                        f"done=false error=parse_error"
+                    )
+                    continue
+
+                error_msg = "null"
 
                 # Execute action in environment
                 observation, reward, done, info = env.step(action)
+
+                # Feed the outcome back into the conversation
+                outcome = observation.error_message or observation.last_query_result
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"RESULT OF YOUR LAST ACTION:\n{outcome}\n\n"
+                            "If this answers the question, respond with "
+                            '{"submit_answer": "..."}. Otherwise respond with '
+                            'another {"sql_query": "..."}. JSON only.'
+                        ),
+                    }
+                )
 
                 # Track reward
                 reward_value = reward.value
@@ -232,7 +341,7 @@ def run_single_task(
                         final_score = 0.01
                     if final_score >= 1.0:
                         final_score = 0.99
-                except:
+                except Exception:
                     done = True
                     success = False
                     final_score = 0.01
