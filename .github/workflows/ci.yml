@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run regression suite
+        run: python tests/test_environment.py
+
+  docker:
+    name: Docker image builds and serves
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t openenv-sql-analyst .
+
+      - name: Container answers a real query over HTTP
+        run: |
+          docker run -d --name env -p 7860:7860 openenv-sql-analyst
+          for i in $(seq 1 30); do
+            curl -sf localhost:7860/ > /dev/null && break
+            sleep 1
+          done
+
+          curl -sf -X POST localhost:7860/reset \
+            -H 'Content-Type: application/json' -d '{"seed": 42}' > /dev/null
+
+          BODY=$(curl -sf -X POST localhost:7860/step \
+            -H 'Content-Type: application/json' \
+            -d '{"sql_query": "SELECT COUNT(*) FROM users"}')
+          echo "$BODY"
+
+          # A valid SELECT must succeed. This is the exact request that used to
+          # fail with "signal only works in main thread of the main interpreter".
+          echo "$BODY" | grep -q '"error_message":""' \
+            || { echo "::error::valid SELECT returned an error"; exit 1; }
+          echo "$BODY" | grep -q '"value":0.1' \
+            || { echo "::error::expected +0.1 reward for a successful query"; exit 1; }
+
+      - name: Container refuses a mutation
+        run: |
+          curl -sf -X POST localhost:7860/reset \
+            -H 'Content-Type: application/json' -d '{}' > /dev/null
+
+          BODY=$(curl -sf -X POST localhost:7860/step \
+            -H 'Content-Type: application/json' \
+            -d '{"sql_query": "REPLACE INTO users VALUES (1,'"'"'x'"'"','"'"'x'"'"','"'"'x'"'"','"'"'x'"'"')"}')
+          echo "$BODY"
+
+          echo "$BODY" | grep -q '"value":-1.0' \
+            || { echo "::error::mutation was not blocked"; exit 1; }
+
+      - name: Container runs as a non-root user
+        run: |
+          USER_ID=$(docker exec env id -u)
+          test "$USER_ID" != "0" \
+            || { echo "::error::container is running as root"; exit 1; }
+          echo "running as uid $USER_ID"
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f env || true
