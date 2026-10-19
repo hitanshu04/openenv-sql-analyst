@@ -33,6 +33,15 @@ jobs:
       - name: Run regression suite
         run: python tests/test_environment.py
 
+      - name: Run baseline harness tests (offline, scripted model)
+        run: python tests/test_baselines.py
+
+      # Scripted cheaters attack the grader and reward on every commit. The
+      # build fails if any cheater is graded correct, out-scores or out-earns
+      # an honest agent, or changes the data.
+      - name: Run cheat suite
+        run: python -m adversaries
+
   docker:
     name: Docker image builds and serves
     runs-on: ubuntu-latest
@@ -51,8 +60,9 @@ jobs:
             sleep 1
           done
 
+          # Pinned task: the +0.1 depends on which tables the task needs.
           curl -sf -X POST localhost:7860/reset \
-            -H 'Content-Type: application/json' -d '{"seed": 42}' > /dev/null
+            -H 'Content-Type: application/json' -d '{"task_id": "easy_user_count"}' > /dev/null
 
           BODY=$(curl -sf -X POST localhost:7860/step \
             -H 'Content-Type: application/json' \

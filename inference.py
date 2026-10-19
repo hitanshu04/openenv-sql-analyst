@@ -3,7 +3,7 @@
 # Baseline Inference Script for OpenEnv SQL Analyst
 # Uses OpenAI API client to run model against the environment
 #
-# HACKATHON REQUIREMENT: Must run ALL 3 tasks and output [START]/[STEP]/[END] for each
+# HACKATHON REQUIREMENT: Must run every task and output [START]/[STEP]/[END] for each
 
 import os
 import sys
@@ -369,10 +369,10 @@ def run_inference():
 
     This function:
     1. Initializes the OpenAI client with injected LiteLLM proxy credentials
-    2. Runs the model against EACH of the 3 tasks
+    2. Runs the model against every task in TASKS
     3. Outputs structured logs in the exact required format for each task
 
-    HACKATHON REQUIREMENT: Must run all 3 tasks to pass "3+ tasks with graders" check
+    HACKATHON REQUIREMENT: Must run every task to pass the "3+ tasks with graders" check
     """
     # ============================================
     # CONFIGURATION - Read env vars at runtime
@@ -386,7 +386,7 @@ def run_inference():
     client = OpenAI(base_url=api_base_url, api_key=api_key)
 
     # ============================================
-    # RUN ALL 3 TASKS
+    # RUN EVERY TASK
     # Hackathon requires: "3+ tasks with graders"
     # Validator: "Enumerate tasks, run each grader, verify scores"
     # ============================================
