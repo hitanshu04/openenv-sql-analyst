@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from environment.env import SQLAnalystEnv, MAX_STEPS
 from environment.models import Action
-from environment.tasks import TASKS, resolve_ground_truth
+from environment.tasks import get_task_by_id, resolve_ground_truth
 
 
 # --------------------------------------------------------------------------
@@ -131,7 +131,7 @@ def demo_episode() -> None:
 
     env = SQLAnalystEnv()
     obs = env.reset(seed=42, task_id="hard_top_spender")
-    truth = resolve_ground_truth(TASKS[2], env.db_engine)
+    truth = resolve_ground_truth(get_task_by_id("hard_top_spender"), env.db_engine)
 
     question = textwrap.fill(
         obs.current_question, width=88, initial_indent="", subsequent_indent="            "
@@ -153,7 +153,7 @@ def demo_episode() -> None:
         "JOIN purchases p ON u.user_id = p.user_id GROUP BY u.user_id "
         "ORDER BY spend DESC LIMIT 1"
     )), "the actual analysis", rewards)
-    play(env, Action(submit_answer="alice"), "submit the answer", rewards)
+    play(env, Action(submit_answer=truth), "submit the answer", rewards)
 
     reward_trace(rewards)
 
@@ -208,15 +208,28 @@ def demo_grader() -> None:
     rule("3. THE GRADER CANNOT BE GAMED")
     print()
 
+    env = SQLAnalystEnv()
+    env.reset()
+    top = resolve_ground_truth(get_task_by_id("hard_top_spender"), env.db_engine)
+    revenue = resolve_ground_truth(get_task_by_id("medium_usa_revenue"), env.db_engine)
+    usernames = env.db_engine.execute_privileged_column("SELECT username FROM users")
+    env.close()
+
+    # (task, run the reference query before answering?, answer, note)
     cases = [
-        ("alice", "the exact answer"),
-        ("The top spender is alice.", "a natural-language answer"),
-        ("alice bob charlie diana eve frank grace", "every candidate at once"),
+        ("hard_top_spender", True, top, "the exact answer"),
+        ("hard_top_spender", True, f"The top spender is {top}.", "a natural-language answer"),
+        ("hard_top_spender", True, " ".join(usernames), "every candidate at once"),
+        ("medium_usa_revenue", True, f"${revenue:,.2f}", "a formatted number"),
+        ("medium_usa_revenue", True, f"{revenue} or {round(revenue * 1.1, 2)}", "two numbers at once"),
+        ("hard_top_spender", False, top, "right, but never checked the data"),
     ]
 
-    for answer, note in cases:
+    for task_id, checked, answer, note in cases:
         env = SQLAnalystEnv()
-        env.reset(seed=1, task_id="hard_top_spender")
+        env.reset(seed=1, task_id=task_id)
+        if checked:
+            env.step(Action(sql_query=get_task_by_id(task_id).ground_truth_sql))
         _, _, _, info = env.step(Action(submit_answer=answer))
         if info["success"]:
             verdict = f"{GREEN}correct {RESET}"
@@ -240,7 +253,9 @@ def demo_seeding() -> None:
         env = SQLAnalystEnv()
         env.reset(seed=seed)
         task = env.state()["task_id"]
-        print(f"  {DIM}reset(seed={seed}){RESET}".ljust(30) + f"-> task={CYAN}{task}{RESET}")
+        # Pad the visible text, not the colour codes, so columns line up in a terminal too.
+        label = f"reset(seed={seed})"
+        print(f"  {DIM}{label:<28}{RESET}-> task={CYAN}{task}{RESET}")
         env.close()
         pause(0.6)
 
