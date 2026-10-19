@@ -101,25 +101,113 @@ endpoints:
 # Each task has a unique ID, description, difficulty, and grader function
 tasks:
   - task_id: easy_user_count
-    description: "Count the total number of users in the database"
+    description: "Single table COUNT query on users table"
     difficulty: easy
     question: "How many users are registered in the system? Provide the total count as a single number."
     grader: environment.graders:grade_answer
-    ground_truth: 15
+    ground_truth: 60
     max_steps: 15
 
   - task_id: medium_usa_revenue
-    description: "Calculate total revenue from USA customers using JOIN"
+    description: "Two-table JOIN with SUM aggregation filtered by country"
     difficulty: medium
     question: "What is the total revenue (sum of total_amount) from purchases made by users in the USA? Provide the total as a number (rounded to 2 decimal places if needed)."
     grader: environment.graders:grade_answer
-    ground_truth: 2423.87
+    ground_truth: 8245.30
     max_steps: 15
 
   - task_id: hard_top_spender
-    description: "Find the top spending user using complex aggregation"
+    description: "Complex query with JOIN, GROUP BY, ORDER BY, and LIMIT"
     difficulty: hard
     question: "Who is the top spender (user with highest total purchase amount)? Provide the username of the user who spent the most money in total."
     grader: environment.graders:grade_answer
-    ground_truth: "alice"
+    ground_truth: "sofia"
+    max_steps: 15
+
+  - task_id: medium_unsold_products
+    description: "Anti-join: LEFT JOIN, keep rows with no match (IS NULL)"
+    difficulty: medium
+    question: "How many products have never been purchased? Provide the count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 4
+    max_steps: 15
+
+  - task_id: medium_multi_category_buyers
+    description: "GROUP BY with HAVING over COUNT(DISTINCT ...), counted in a subquery"
+    difficulty: medium
+    question: "How many users have bought products from at least 4 different categories? Provide the count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 37
+    max_steps: 15
+
+  - task_id: medium_best_month
+    description: "Date bucketing with strftime, then aggregate and order"
+    difficulty: medium
+    question: "Which month of 2024 had the highest total revenue (sum of total_amount)? Answer in YYYY-MM format, e.g. 2024-01."
+    grader: environment.graders:grade_answer
+    ground_truth: "2024-04"
+    max_steps: 15
+
+  - task_id: hard_spend_rank
+    description: "Window function RANK() over an aggregate, filtered in an outer query"
+    difficulty: hard
+    question: "Rank the users who made at least one purchase by total spend (sum of total_amount), highest first, with rank 1 for the top spender. What is karen's rank? Provide the rank as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 46
+    max_steps: 15
+
+  - task_id: hard_net_revenue_country
+    description: "Three-table JOIN with a LEFT JOIN to refunds; gross and net rank differently"
+    difficulty: hard
+    question: "Which country's users generated the highest net revenue? Net revenue is the sum of total_amount minus the sum of refund_amount for refunded purchases. Provide the country name."
+    grader: environment.graders:grade_answer
+    ground_truth: "Canada"
+    max_steps: 15
+
+  - task_id: hard_top_buyer_tiebreak
+    description: "Aggregate with an explicit tie-break: the data has a tie at the top"
+    difficulty: hard
+    question: "Which user made the most purchases (number of purchase rows)? If several users are tied, answer with the username that comes first alphabetically."
+    grader: environment.graders:grade_answer
+    ground_truth: "bianca"
+    max_steps: 15
+
+  - task_id: hard_us_signups_dirty_country
+    description: "Dirty data: one country written many ways; explore the values before filtering"
+    difficulty: hard
+    question: "How many signups (rows in the signups table) came from the United States? The country column is typed in by users. Provide the count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 64
+    max_steps: 15
+
+  - task_id: hard_distinct_real_signups
+    description: "Deduplicate on a normalised key and apply a business exclusion rule"
+    difficulty: hard
+    question: "How many distinct people have signed up, excluding internal test accounts (emails at the sqlgym.test domain)? The same person may have signed up more than once. Provide the count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 150
+    max_steps: 15
+
+  - task_id: hard_category_q2_q3_drop
+    description: "Conditional aggregation per quarter, then a ratio; absolute and relative drops disagree"
+    difficulty: hard
+    question: "Which product category had the largest percentage drop in revenue (sum of total_amount) from Q2 2024 (April-June) to Q3 2024 (July-September)? Provide the category name."
+    grader: environment.graders:grade_answer
+    ground_truth: "Kitchen"
+    max_steps: 15
+
+  - task_id: hard_repeat_within_30_days
+    description: "Anchor on each user's first purchase, then date arithmetic with julianday"
+    difficulty: hard
+    question: "How many users made another purchase 1 to 30 days after their first ever purchase? Provide the count as a single number."
+    grader: environment.graders:grade_answer
+    ground_truth: 25
+    max_steps: 15
+
+  - task_id: medium_median_order_value
+    description: "Median without a MEDIAN function: ORDER BY with LIMIT/OFFSET; AVG is the trap"
+    difficulty: medium
+    question: "What is the median total_amount across all purchases? Provide it as a number rounded to 2 decimal places."
+    grader: environment.graders:grade_answer
+    ground_truth: 79.99
     max_steps: 15
