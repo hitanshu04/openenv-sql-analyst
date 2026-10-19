@@ -1,9 +1,6 @@
 # OpenEnv SQL Analyst Environment Dependencies
 # Optimized for 8GB RAM constraint
 
-# Core framework
-openenv-core>=0.1.0
-
 # Pydantic for typed models
 pydantic>=2.0.0
 
@@ -12,9 +9,15 @@ openai>=1.0.0
 
 # Database (sqlite3 is built-in, no extra deps needed)
 
-# HTTP server dependencies (typically bundled with openenv-core)
+# HTTP server. The OpenEnv reset/step/state contract is implemented directly
+# on FastAPI. openenv-core was removed: env.py's BaseEnv import from it never
+# resolved, and its unpinned dependency tree broke installs on some machines.
 uvicorn>=0.23.0
 fastapi>=0.100.0
+
+# Required by FastAPI's TestClient (HTTP tests). Previously it arrived only
+# transitively through openenv-core.
+httpx>=0.24.0
 
 # Utilities
 python-dotenv>=1.0.0

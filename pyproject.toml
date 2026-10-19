@@ -8,9 +8,10 @@ version = "0.1.0"
 description = "OpenEnv SQL Data Analyst Agent"
 requires-python = ">=3.10"
 dependencies = [
-    "openenv-core",
-    "pydantic",
-    "openai"
+    "pydantic>=2.0.0",
+    "openai>=1.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
 ]
 
 [project.scripts]
