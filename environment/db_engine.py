@@ -68,6 +68,11 @@ class DatabaseEngine:
         # Lifted only by execute_privileged(), for environment-internal queries.
         # No SQL an agent can write reaches this flag.
         self._privileged: bool = False
+        # Data tables the most recent execute_query() read, as reported by the
+        # authorizer. The environment compares this with the tables the task's
+        # reference SQL reads, to pay for progress rather than activity.
+        self._tables_read: set = set()
+        self.last_query_tables: frozenset = frozenset()
 
     def _authorizer(self, action: int, arg1, arg2, db_name, trigger_name) -> int:
         """
@@ -81,6 +86,10 @@ class DatabaseEngine:
         because sqlite3.set_authorizer(None) does not reliably clear an
         installed authorizer on older Python versions (verified on 3.9).
         """
+        # SQLITE_READ names the table being read, even for COUNT(*) (column
+        # ""). sqlite_* system tables are not data, so they don't count.
+        if action == sqlite3.SQLITE_READ and arg1 and not arg1.startswith("sqlite_"):
+            self._tables_read.add(arg1)
         if self._privileged:
             return sqlite3.SQLITE_OK
         return sqlite3.SQLITE_OK if action in ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
@@ -100,7 +109,7 @@ class DatabaseEngine:
             self.connection = sqlite3.connect(
                 ':memory:',
                 timeout=QUERY_TIMEOUT,
-                check_same_thread=False
+                check_same_thread=False,
             )
             self.cursor = self.connection.cursor()
 
@@ -119,7 +128,7 @@ class DatabaseEngine:
             self._schema_cache = self._get_schema_info()
 
             # Seal the database: from here on the agent may only read.
-            self.connection.set_authorizer(self._authorizer)
+            self._arm_authorizer()
 
             return "Database initialized successfully"
 
@@ -220,6 +229,31 @@ class DatabaseEngine:
         finally:
             self._privileged = False
 
+    def tables_read_by(self, query: str) -> frozenset:
+        """
+        Data tables a trusted query reads, as reported by the authorizer.
+
+        Used by the environment to find which tables a task's reference SQL
+        needs. Never reachable from an agent action.
+        """
+        self._arm_authorizer()
+        self._tables_read = set()
+        self.execute_privileged(query)
+        return frozenset(self._tables_read)
+
+    def _arm_authorizer(self) -> None:
+        """
+        (Re)install the authorizer before a statement runs.
+
+        SQLite consults the authorizer only while preparing a statement, and
+        Python reuses prepared statements from its cache. Before Python 3.11
+        that cache cannot be disabled (cached_statements=0 is ignored), so a
+        repeated query skipped the authorizer and reported no tables read.
+        Installing an authorizer expires every prepared statement, so the next
+        execute is prepared afresh and checked under the current privilege.
+        """
+        self.connection.set_authorizer(self._authorizer)
+
     def _install_timeout(self, seconds: float) -> None:
         """Arm a wall-clock budget for the next query."""
         deadline = time.monotonic() + seconds
@@ -245,6 +279,9 @@ class DatabaseEngine:
         Returns:
             Tuple[str, QueryStatus]: (result_string, status)
         """
+        self._tables_read = set()
+        self.last_query_tables = frozenset()
+
         if not self.connection or not self.cursor:
             return "Error: Database not initialized", QueryStatus.ERROR
 
@@ -254,6 +291,7 @@ class DatabaseEngine:
             return "Error: Empty query provided", QueryStatus.ERROR
 
         try:
+            self._arm_authorizer()
             self._install_timeout(QUERY_TIMEOUT)
             self.cursor.execute(query)
 
@@ -315,6 +353,7 @@ class DatabaseEngine:
 
         finally:
             self._clear_timeout()
+            self.last_query_tables = frozenset(self._tables_read)
 
     def close(self):
         """Close the database connection."""

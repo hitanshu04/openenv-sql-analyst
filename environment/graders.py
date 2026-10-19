@@ -60,23 +60,45 @@ def normalize_value(value: Any) -> str:
     return str_value
 
 
-def extract_numeric(value: str) -> Optional[float]:
+# A number as people write it: optional minus, optional "$", digits with
+# optional thousands separators, optional decimals, optional ordinal suffix
+# ("46th"). The sign and the decimals belong to the number, so "-15" and
+# "15.5" are not read as 15, and "15." at the end of a sentence is 15.
+# "13,14,15" is three numbers, not 131,415.
+NUMBER_PATTERN = re.compile(
+    r"(?<![\w.])(-?)\$?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(?:st|nd|rd|th)?(?!\w)"
+)
+
+
+def extract_numbers(text: Any) -> List[float]:
+    """Every number written in `text`, in order."""
+    return [
+        float(sign + whole.replace(",", "") + (decimals or ""))
+        for sign, whole, decimals in NUMBER_PATTERN.findall(str(text))
+    ]
+
+
+def compare_numeric(submitted: Any, truth: float) -> Tuple[bool, float]:
     """
-    Extract a numeric value from a string.
+    Grade a numeric answer: it must contain exactly one distinct number, and
+    that number is the answer. (Decision D8 in the v2 audit.)
 
-    Args:
-        value: String that may contain a number
-
-    Returns:
-        Optional[float]: Extracted number or None
+    Whole-word matching, which categorical answers use, let a numeric answer
+    win by containing the right digits anywhere: "0 1 2 ... 45" and
+    "2204.87 or 2425.36" were graded correct, and so were "-15" and "15.5"
+    in a sentence. Numeric tasks have no answer domain to catch a guess-list,
+    so the guard is "one number only", which is what the questions ask for.
     """
-    # Remove common formatting
-    cleaned = re.sub(r"[$,]", "", str(value).strip())
-
-    try:
-        return float(cleaned)
-    except (ValueError, TypeError):
-        return None
+    numbers = set(extract_numbers(submitted))
+    if len(numbers) != 1:
+        return False, MIN_SCORE  # no number, or a guess-list
+    value = numbers.pop()
+    if abs(value - truth) < 0.01:
+        return True, MAX_SCORE
+    # Partial credit for being close (within 10%)
+    if truth != 0 and abs(value - truth) / abs(truth) < 0.1:
+        return False, 0.5
+    return False, MIN_SCORE
 
 
 def contains_whole_word(text: Any, word: Any) -> bool:
@@ -114,13 +136,15 @@ def compare_values(
     """
     Compare submitted answer to ground truth.
 
-    Matching is deliberately ordered from strictest to loosest:
+    Numeric ground truths are graded by compare_numeric: the answer is the one
+    number the submission contains.
+
+    Categorical answers are matched from strictest to loosest:
       1. exact match after normalization
-      2. numeric comparison with tolerance and partial credit
-      3. whole-word containment, so a natural-language answer such as
+      2. whole-word containment, so a natural-language answer such as
          "The top spender is alice." still counts
 
-    Step 3 is guarded: if the submission names more than one value from
+    Step 2 is guarded: if the submission names more than one value from
     `answer_domain`, it is a guess-list rather than an answer and is rejected.
     Without that guard an agent can submit every candidate and score full
     marks, which is reward hacking rather than analysis.
@@ -136,82 +160,18 @@ def compare_values(
             - is_correct: True if answer matches
             - score: Value STRICTLY between 0 and 1
     """
-    # Normalize both values
-    norm_submitted = normalize_value(submitted)
-    norm_truth = normalize_value(ground_truth)
+    if isinstance(ground_truth, (int, float)) and not isinstance(ground_truth, bool):
+        return compare_numeric(submitted, float(ground_truth))
 
     # 1. Direct string comparison after normalization
-    if norm_submitted == norm_truth:
+    if normalize_value(submitted) == normalize_value(ground_truth):
         return True, MAX_SCORE  # 0.99 instead of 1.0
 
-    # 2. Try numeric comparison for numeric ground truths
-    if isinstance(ground_truth, (int, float)):
-        submitted_num = extract_numeric(submitted)
-        if submitted_num is not None:
-            truth_num = float(ground_truth)
-            # Allow small floating point tolerance
-            if abs(submitted_num - truth_num) < 0.01:
-                return True, MAX_SCORE  # 0.99 instead of 1.0
-            # Partial credit for being close (within 10%)
-            if truth_num != 0:
-                error_pct = abs(submitted_num - truth_num) / abs(truth_num)
-                if error_pct < 0.1:
-                    return False, 0.5
-
-    # 3. Whole-word containment, rejected if the answer hedges across candidates
+    # 2. Whole-word containment, rejected if the answer hedges across candidates
     if contains_whole_word(submitted, ground_truth):
         if answer_domain and count_domain_matches(submitted, answer_domain) > 1:
             return False, MIN_SCORE  # listing every option is not answering
         return True, MAX_SCORE  # 0.99 instead of 1.0
-
-    return False, MIN_SCORE  # 0.01 instead of 0.0
-
-
-def grade_sql_result(
-    query_result: str, ground_truth: Any, is_error: bool
-) -> Tuple[bool, float]:
-    """
-    Grade a SQL query result against ground truth.
-
-    If the agent submits a SQL query as the final answer,
-    this function evaluates the query result.
-
-    Args:
-        query_result: The result string from executing the SQL query
-        ground_truth: The expected correct answer
-        is_error: Whether the query execution resulted in an error
-
-    Returns:
-        Tuple[bool, float]: (is_correct, score)
-    """
-    if is_error:
-        return False, MIN_SCORE  # 0.01 instead of 0.0
-
-    # Parse the query result to extract values
-    # Result format is markdown table: | col1 | col2 |
-    lines = query_result.strip().split("\n")
-
-    # Skip header and separator lines
-    data_lines = [l for l in lines if l.strip() and not l.startswith("|---")]
-
-    if len(data_lines) < 2:  # Need at least header + 1 data row
-        return False, MIN_SCORE  # 0.01 instead of 0.0
-
-    # Get the first data row (skip header)
-    data_row = data_lines[1] if len(data_lines) > 1 else ""
-
-    # Extract values from the row
-    values = [v.strip() for v in data_row.split("|") if v.strip()]
-
-    if not values:
-        return False, MIN_SCORE  # 0.01 instead of 0.0
-
-    # For single-value answers, compare the first value
-    # For multi-column results, try each value
-    for value in values:
-        is_correct, score = compare_values(value, ground_truth)
-        if is_correct:
-            return True, score
 
     return False, MIN_SCORE  # 0.01 instead of 0.0
 
@@ -227,10 +187,18 @@ def grade_answer(
 
     This is the main grading function called by the environment.
 
+    A submission is always graded as a VALUE, never executed as SQL. The task
+    asks for the value itself, and the agent has sql_query actions for running
+    queries. The previous version executed any answer containing SELECT, FROM,
+    WHERE, JOIN, GROUP or ORDER, so a correct sentence such as "The total
+    revenue from USA customers is 2204.87" failed as broken SQL and scored
+    0.01. (Decision D1 in the v2 audit.)
+
     Args:
         submitted_answer: The agent's submitted answer string
         ground_truth: The expected correct answer
-        db_engine: Optional database engine for SQL evaluation
+        db_engine: Unused. Kept so existing callers keep working.
+        answer_domain: Legitimate candidate answers, used to reject hedging
 
     Returns:
         Tuple[bool, float]: (is_correct, score)
@@ -240,30 +208,22 @@ def grade_answer(
     if not submitted_answer or not submitted_answer.strip():
         return False, MIN_SCORE  # 0.01 instead of 0.0
 
-    submitted = submitted_answer.strip()
-
-    # Check if the submitted answer looks like a SQL query
-    sql_keywords = ["SELECT", "FROM", "WHERE", "JOIN", "GROUP", "ORDER"]
-    is_sql_query = any(keyword in submitted.upper() for keyword in sql_keywords)
-
-    if is_sql_query and db_engine is not None:
-        # Execute the SQL and grade the result
-        result, status = db_engine.execute_query(submitted)
-        return grade_sql_result(result, ground_truth, status != "ok")
-
-    # Direct answer comparison
-    return compare_values(submitted, ground_truth, answer_domain)
+    return compare_values(submitted_answer.strip(), ground_truth, answer_domain)
 
 
 def calculate_final_score(
-    is_correct: bool, grading_score: float, total_steps: int, max_steps: int = 15
+    is_correct: bool,
+    grading_score: float,
+    total_steps: int,
+    max_steps: int = 15,
+    verified: bool = True,
 ) -> float:
     """
     Calculate the final score for a task.
 
     Scoring factors:
     - Correctness is primary
-    - Efficiency bonus for fewer steps
+    - Efficiency bonus for fewer steps, only for a verified answer
     - Partial credit is preserved for near-miss numeric answers
 
     Args:
@@ -273,6 +233,11 @@ def calculate_final_score(
             would otherwise be computed and then discarded.
         total_steps: Number of steps taken
         max_steps: Maximum allowed steps
+        verified: Whether the agent read every table the task needs before
+            answering. A correct answer without that evidence still counts as
+            correct, but earns no efficiency bonus: otherwise a lucky
+            one-step guess (0.96) outranked every agent that checked the data.
+            (Decision D9 in the v2 audit.)
 
     Returns:
         float: Final score STRICTLY between 0 and 1
@@ -284,6 +249,8 @@ def calculate_final_score(
 
     # Base score for correct answer
     base_score = 0.7
+    if not verified:
+        return base_score
 
     # Efficiency bonus (up to 0.28 to stay under 0.99)
     # Fewer steps = higher bonus

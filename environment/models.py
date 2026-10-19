@@ -61,8 +61,9 @@ class Reward(BaseModel):
     """
     Reward model containing a single float value.
     
-    Reward shaping follows the PRD specification:
-    - +0.1: Successful, error-free SQL query
+    Reward shaping:
+    - +0.1: per table the task needs, the first time a query reads it
+    - -0.01: any other successful query (e.g. SELECT 1, a repeat)
     - -0.1: SQLite syntax error
     - -1.0: Destructive action detected (done=True)
     - -0.5: Step count >= 15 (infinite loop shield, done=True)

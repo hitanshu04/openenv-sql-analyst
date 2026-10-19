@@ -1,6 +1,6 @@
 # environment/env.py
 # Main OpenEnv Environment for SQL Data Analyst
-# Inherits from openenv.BaseEnv and implements reset(), step(), state()
+# Implements the OpenEnv reset() / step() / state() contract directly.
 
 from typing import Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
@@ -15,20 +15,25 @@ from .tasks import (
 )
 from .graders import grade_answer, calculate_final_score
 
-# Try to import openenv.BaseEnv, fallback to a simple base class if not available
-try:
-    from openenv import BaseEnv
-except ImportError:
-    # Fallback base class for development/testing
-    class BaseEnv:
-        """Fallback base class when openenv-core is not installed."""
-        pass
+# The OpenEnv contract (reset/step/state over HTTP) is implemented directly.
+# An earlier version tried `from openenv import BaseEnv` with a fallback, but
+# openenv-core never provided BaseEnv, so the fallback always ran and the
+# dependency did nothing except break installs. (Decision D7 in the v2 audit.)
 
 
 # ============================================
 # REWARD CONSTANTS (per PRD specification)
 # ============================================
-REWARD_SUCCESSFUL_QUERY = 0.1      # Successful, error-free SQL query
+# Bounded progress reward (Decision D2 in the v2 audit). A successful query
+# earns +0.1 for each table the task's reference SQL needs that it reads FOR
+# THE FIRST TIME this episode; any other successful query costs 0.01. Each
+# needed table pays once, so query reward is capped at 0.1 x (needed tables):
+# the efficient agent collects the whole cap, and every extra query lowers the
+# total. Two earlier rules were exploitable: paying every successful query
+# (13 x "SELECT 1" earned 2.3 vs 1.1), and paying every "new result" (renaming
+# a column made each result new, again 2.3 vs 1.1).
+REWARD_PROGRESS = 0.1              # Per needed table, the first time it is read
+REWARD_NO_PROGRESS = -0.01         # Successful query that read no new needed table
 REWARD_SYNTAX_ERROR = -0.1         # SQLite syntax error
 REWARD_DESTRUCTIVE_ACTION = -1.0   # Destructive action detected
 REWARD_INFINITE_LOOP = -0.5        # Step count >= 15
@@ -55,6 +60,11 @@ class EnvironmentState:
         rewards: List of all rewards received in this episode
         final_score: The final grading score (0.0 to 1.0)
         success: Whether the task was completed successfully
+        required_tables: Tables the task's reference SQL reads. Never shown
+            to the agent.
+        credited_tables: Required tables the agent has already been paid for
+        verified: Set at submission: whether the agent had read every
+            required table, i.e. whether the answer is backed by the data
     """
     task: Optional[Task] = None
     ground_truth: Any = None
@@ -68,9 +78,12 @@ class EnvironmentState:
     rewards: list = field(default_factory=list)
     final_score: float = 0.0
     success: bool = False
+    required_tables: frozenset = frozenset()
+    credited_tables: set = field(default_factory=set)
+    verified: bool = False
 
 
-class SQLAnalystEnv(BaseEnv):
+class SQLAnalystEnv:
     """
     SQL Data Analyst Reinforcement Learning Environment.
     
@@ -82,16 +95,16 @@ class SQLAnalystEnv(BaseEnv):
     - step(action): Execute an action and return (observation, reward, done, info)
     - state(): Return the current internal state
     
-    Reward Shaping (per PRD):
-    - +0.1: Successful, error-free SQL query
+    Reward Shaping:
+    - +0.1: per table the task needs, the first time a query reads it
+    - -0.01: any other successful query (e.g. SELECT 1, a repeat)
     - -0.1: SQLite syntax error
     - -1.0: Destructive action detected (done=True)
     - -0.5: Step count >= 15 (infinite loop shield, done=True)
     """
-    
+
     def __init__(self):
         """Initialize the SQL Analyst environment."""
-        super().__init__()
         self.db_engine = DatabaseEngine()
         self._state = EnvironmentState()
     
@@ -142,6 +155,9 @@ class SQLAnalystEnv(BaseEnv):
         # the same data the agent will query. Ground truth cannot drift.
         self._state.ground_truth = resolve_ground_truth(self._state.task, self.db_engine)
         self._state.answer_domain = resolve_answer_domain(self._state.task, self.db_engine)
+        self._state.required_tables = self.db_engine.tables_read_by(
+            self._state.task.ground_truth_sql
+        )
 
         # Reset state
         self._state.step_count = 0
@@ -151,7 +167,9 @@ class SQLAnalystEnv(BaseEnv):
         self._state.rewards = []
         self._state.final_score = 0.0
         self._state.success = False
-        
+        self._state.credited_tables = set()
+        self._state.verified = False
+
         # Build initial observation
         return Observation(
             schema_info=self.db_engine.get_schema(),
@@ -171,7 +189,8 @@ class SQLAnalystEnv(BaseEnv):
         - info: Additional information
         
         Reward Shaping:
-        - +0.1: Successful, error-free SQL query
+        - +0.1: per needed table, the first time a query reads it
+        - -0.01: any other successful query
         - -0.1: SQLite syntax error
         - -1.0: Destructive action detected (done=True)
         - -0.5: Step count >= 15 (done=True)
@@ -240,10 +259,16 @@ class SQLAnalystEnv(BaseEnv):
             self._state.last_query_result = ""
             return REWARD_SYNTAX_ERROR
 
-        # Successful query
+        # Successful query: pay only for needed tables read for the first time.
         self._state.last_query_result = result
         self._state.error_message = ""
-        return REWARD_SUCCESSFUL_QUERY
+        newly_read = (
+            self.db_engine.last_query_tables & self._state.required_tables
+        ) - self._state.credited_tables
+        if not newly_read:
+            return REWARD_NO_PROGRESS
+        self._state.credited_tables |= newly_read
+        return round(REWARD_PROGRESS * len(newly_read), 4)
     
     def _handle_submit_answer(self, answer: str) -> float:
         """
@@ -268,12 +293,15 @@ class SQLAnalystEnv(BaseEnv):
 
         # Calculate final score. grading_score carries the grader's partial
         # credit for near-miss numeric answers, which the score must honour.
+        # The efficiency bonus needs evidence: every required table read.
         self._state.success = is_correct
+        self._state.verified = self._state.credited_tables >= self._state.required_tables
         self._state.final_score = calculate_final_score(
             is_correct,
             grading_score,
             self._state.step_count,
-            MAX_STEPS
+            MAX_STEPS,
+            verified=self._state.verified,
         )
         
         # Reward for submission is based on correctness
@@ -309,6 +337,7 @@ class SQLAnalystEnv(BaseEnv):
             "task_id": self._state.task.task_id if self._state.task else None,
             "task_difficulty": self._state.task.difficulty if self._state.task else None,
             "success": self._state.success,
+            "verified": self._state.verified,
             "final_score": self._state.final_score,
             "total_reward": sum(self._state.rewards),
             "rewards_history": self._state.rewards.copy()
@@ -334,6 +363,7 @@ class SQLAnalystEnv(BaseEnv):
             "rewards": self._state.rewards.copy(),
             "total_reward": sum(self._state.rewards),
             "success": self._state.success,
+            "verified": self._state.verified,
             "final_score": self._state.final_score
         }
     
